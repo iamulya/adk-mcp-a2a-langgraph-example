@@ -1,4 +1,4 @@
-# ADK/LangGraph A2A YouTube Summarizer 
+# ADK/LangGraph MCP A2A YouTube Summarizer 
 
 This project demonstrates inter-agent communication using the A2A protocol between an agent built with Google's Agent Development Kit (ADK) and another built with LangGraph. It uses real MCP tool endpoints and Google Cloud Secret Manager for API key handling.
 
