@@ -1,7 +1,7 @@
 import json
 import logging
 import asyncio
-from typing import AsyncIterable
+from typing import AsyncIterable, List, Tuple
 
 # Assuming 'common' library is available via install or copied path
 try:
@@ -27,16 +27,18 @@ class AgentTaskManager(InMemoryTaskManager):
         super().__init__()
         self.agent = agent
 
-    def _parse_agent_result(self, result_content: str) -> tuple[TaskState, list[Artifact]]:
+    def _parse_agent_result(self, result_content: str) -> tuple[TaskState, List[Artifact]]:
         """Parses the agent's JSON string result into A2A TaskStatus and Artifacts."""
         try:
             # Result should be a JSON string list of video IDs or an error message list
             data = json.loads(result_content)
             if isinstance(data, list):
-                # Check if it's an error message list from the tool wrapper or agent
+                # Check if it's an error message list
                 if data and isinstance(data[0], str) and data[0].startswith("Error:"):
-                     parts = [TextPart(text=data[0])] # Return the error message as text
+                     # Return the error message as text part in a FAILED task status
+                     parts = [TextPart(text=data[0])]
                      task_state = TaskState.FAILED
+                     # Artifacts list is usually None for failure, but we include the error text here for clarity in the message
                      artifacts = [Artifact(parts=parts)]
                 else:
                     # Success - list of video IDs
@@ -45,15 +47,15 @@ class AgentTaskManager(InMemoryTaskManager):
                     task_state = TaskState.COMPLETED
                     artifacts = [Artifact(parts=parts)]
             else:
-                # Parsed as JSON but not a list, treat as unexpected text response
-                parts = [TextPart(text=result_content)]
-                task_state = TaskState.COMPLETED # Assume completion, but log warning
+                # Parsed as JSON but not a list, treat as error/unexpected text
+                parts = [TextPart(text=f"Error: Agent returned unexpected JSON type: {type(data).__name__}")]
+                task_state = TaskState.FAILED
                 logger.warning(f"Agent returned non-list JSON: {result_content}")
                 artifacts = [Artifact(parts=parts)]
         except json.JSONDecodeError:
             # Not JSON, likely a direct error message or unexpected output
             parts = [TextPart(text=result_content)]
-            # Assume FAILED if not JSON, as the agent is instructed to return JSON
+            # Assume FAILED if not JSON, as the agent is instructed to return JSON list or JSON error list
             task_state = TaskState.FAILED
             logger.warning(f"Agent returned non-JSON string: {result_content}")
             artifacts = [Artifact(parts=parts)]
@@ -98,13 +100,15 @@ class AgentTaskManager(InMemoryTaskManager):
             if final_result_content is not None:
                  final_task_state, final_artifacts = self._parse_agent_result(str(final_result_content))
             else:
-                 final_artifacts = [Artifact(parts=[TextPart(text="Agent produced no final output.")])]
+                 # If stream finished without final content
+                 final_task_state = TaskState.FAILED
+                 final_artifacts = [Artifact(parts=[TextPart(text="Error: Agent stream ended without final output.")])]
 
         except Exception as e:
             logger.error(f"An error occurred while streaming the response: {e}", exc_info=True)
             final_task_state = TaskState.FAILED
-            fail_message = Message(role="agent", parts=[TextPart(text=f"Stream failed: {type(e).__name__}")])
-            final_artifacts = [Artifact(parts=fail_message.parts)] # Send error as text artifact
+            fail_message_str = f"Stream failed: {type(e).__name__}"
+            final_artifacts = [Artifact(parts=[TextPart(text=fail_message_str)])]
             # Yield internal error response for JSON-RPC level
             yield JSONRPCResponse(
                  id=request.id,

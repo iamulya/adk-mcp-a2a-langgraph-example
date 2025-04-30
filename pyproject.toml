@@ -3,7 +3,7 @@ name = "adk-langgraph-a2a-youtube-summarizer"
 version = "0.1.0"
 description = "A2A communication between LangGraph (YouTube) and ADK (Summary) agents using MCP Tools."
 readme = "README.md"
-requires-python = ">=3.11" # Required for ADK async features and recommended for Langgraph async
+requires-python = ">=3.11"
 dependencies = [
     # Core Frameworks
     "google-adk[mcp]>=0.3.0", # ADK with MCP support
@@ -14,6 +14,9 @@ dependencies = [
     # A2A Communication (using the library)
     "a2a-samples", # Assumes installed via pip or available in workspace
 
+    # Secret Manager
+    "google-cloud-secret-manager>=2.16.0",
+
     # Utilities
     "click>=8.1.0",
     "python-dotenv>=1.0.0",
@@ -21,6 +24,7 @@ dependencies = [
     "sse-starlette>=1.6.0", # For A2A server streaming
     "starlette>=0.30.0",
     "uvicorn[standard]>=0.20.0",
+    "pyyaml>=6.0", # Often needed for MCP tool schemas if complex
 
     # MCP Client dependencies (implicitly included via google-adk[mcp])
     # "mcp-client-python"
@@ -30,21 +34,20 @@ dependencies = [
 members = [
     "langgraph_youtube_agent",
     "adk_summary_agent",
-    # Add 'common' if you copied it locally and it has its own pyproject.toml
+    # "common", # Uncomment if common is local workspace member
+    "utils", # Add utils as a member
 ]
 
-# If 'a2a-samples' is not installed as a package, and you copied 'common',
-# you might need to configure uv.sources if common has its own pyproject.toml
-# [tool.uv.sources]
-# a2a-samples = { path = "common", editable = true } # Example if common is local
+# [tool.uv.sources] # Uncomment and configure if common is local
+# a2a-samples = { path = "common", editable = true }
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["adk_summary_agent", "langgraph_youtube_agent"] # Include agent packages
+packages = ["adk_summary_agent", "langgraph_youtube_agent", "utils"] # Include utils package
 
 [tool.ruff] # Optional: For code formatting/linting
 lint.select = [ "E", "F", "I", "UP", "B" ]
-lint.ignore = [ "E501" ] # Ignore line length errors if needed
+lint.ignore = [ "E501" ]

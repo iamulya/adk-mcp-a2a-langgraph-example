@@ -15,7 +15,10 @@ from .agent import YouTubeVideoAgent
 from .task_manager import AgentTaskManager
 from .tools import _cleanup_mcp_session # Import cleanup function
 
-load_dotenv()
+# Load .env file from the current agent's directory
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=dotenv_path)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,13 +29,16 @@ logger = logging.getLogger(__name__)
 def main(host, port):
     """Starts the LangGraph YouTube Agent A2A server."""
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            raise MissingAPIKeyError("GOOGLE_API_KEY environment variable not set.")
-        if not os.getenv("YOUTUBE_MCP_SERVER_URL"):
-             raise MissingAPIKeyError("YOUTUBE_MCP_SERVER_URL environment variable not set.")
+        # Check for necessary environment variables
+        if not os.getenv("SECRET_PROJECT_ID") or not os.getenv("GOOGLE_API_KEY_SECRET_ID"):
+             raise MissingAPIKeyError("SECRET_PROJECT_ID and GOOGLE_API_KEY_SECRET_ID must be set in .env")
+        if not os.getenv("MCP_URL_GET_PLAYLIST"):
+             raise MissingAPIKeyError("MCP_URL_GET_PLAYLIST environment variable not set.")
+        if not os.getenv("MCP_URL_GET_CHANNEL"):
+            raise MissingAPIKeyError("MCP_URL_GET_CHANNEL environment variable not set.")
 
-        # Initialize the agent (this will trigger MCP connection via tools.py)
-        # We need an event loop running to potentially initialize tools that need it
+        # Initialize the agent (this might trigger MCP connection via tools.py)
+        # Need an event loop running
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -87,10 +93,15 @@ def main(host, port):
         try:
             # Attempt to run cleanup in the loop if it exists
             loop = asyncio.get_event_loop()
+            # Need to check loop state as it might have been closed by server exit
             if loop.is_running():
-                loop.run_until_complete(_cleanup_mcp_session())
+                 # Schedule cleanup if running, don't wait here as server.start() blocks
+                 asyncio.ensure_future(_cleanup_mcp_session(os.getenv("MCP_URL_GET_PLAYLIST")))
+                 asyncio.ensure_future(_cleanup_mcp_session(os.getenv("MCP_URL_GET_CHANNEL")))
             else:
-                asyncio.run(_cleanup_mcp_session())
+                 # Run cleanup synchronously if loop isn't running (e.g., startup error)
+                 asyncio.run(_cleanup_mcp_session(os.getenv("MCP_URL_GET_PLAYLIST")))
+                 asyncio.run(_cleanup_mcp_session(os.getenv("MCP_URL_GET_CHANNEL")))
         except Exception as cleanup_err:
              logger.error(f"Error during MCP cleanup: {cleanup_err}")
 

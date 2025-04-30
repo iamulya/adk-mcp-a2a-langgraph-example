@@ -7,6 +7,7 @@ from google.adk.tools import FunctionTool
 
 # Import async tool functions
 from .tools import summarize_video, combine_summaries, find_videos_via_a2a
+from ..utils.secrets import get_google_api_key_from_secret_manager # Import secret manager utility
 
 logger = logging.getLogger(__name__)
 
@@ -18,22 +19,24 @@ class SummaryAgent:
     SUPPORTED_OUTPUT_TYPES = ["text/plain"]
 
     def __init__(self):
-        google_api_key = os.getenv("GOOGLE_API_KEY")
         use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() == "true"
-
-        if not use_vertex and not google_api_key:
-             raise ValueError("GOOGLE_API_KEY must be set if not using Vertex AI.")
+        google_api_key = None
+        if not use_vertex:
+            try:
+                google_api_key = get_google_api_key_from_secret_manager()
+            except ValueError as e:
+                logger.error(f"Failed to get Google API Key from Secret Manager: {e}")
+                raise ValueError("GOOGLE_API_KEY_SECRET_ID and SECRET_PROJECT_ID must be set in .env when not using Vertex AI.") from e
 
         model_name = "gemini-1.5-flash-latest"
         logger.info(f"Initializing SummaryAgent with model: {model_name}, Vertex: {use_vertex}")
 
         # Wrap tools for ADK, explicitly passing configured A2A URL to the A2A tool
+        # *** Tool names for FunctionTool will be the Python function names ***
         find_videos_tool = FunctionTool(
             func=find_videos_via_a2a,
-            # Pre-configure the youtube_agent_url for this tool instance
             kwargs={"youtube_agent_url": YOUTUBE_AGENT_A2A_URL}
         )
-        # ADK handles wrapping the async functions automatically
         summarize_video_tool = FunctionTool(func=summarize_video)
         combine_summaries_tool = FunctionTool(func=combine_summaries)
 
@@ -46,8 +49,8 @@ You have access to the following tools:
 3.  `{combine_summaries_tool.name}`: Takes a list of individual summary strings (`summaries`) and returns a final combined summary string via an MCP call. It might return an error message string starting with 'Error:'.
 
 Workflow:
-1.  Receive the user's request (e.g., "Summarize videos from channel X on date Y", "Summarize playlist Z").
-2.  Call `{find_videos_tool.name}` with the `query` containing the specific channel/playlist details and the current `session_id`.
+1.  Receive the user's request (e.g., "Summarize videos from channel X on date Y", "Summarize playlist Z"). Extract the `session_id` from the state.
+2.  Call `{find_videos_tool.name}` with the `query` containing the specific channel/playlist details and the extracted `session_id`.
 3.  Carefully analyze the list returned by `{find_videos_tool.name}`.
 4.  If the list contains an error string (the first element starts with 'Error:'): Inform the user about the specific error reported by the tool. STOP processing.
 5.  If the list is empty: Inform the user that no videos were found for their criteria. STOP processing.
@@ -56,27 +59,33 @@ Workflow:
     b. Keep track of any errors during summarization.
     c. For EACH `video_id` in the list:
         i. Call `{summarize_video_tool.name}` with the current `video_id`.
-        ii. Check the result: If it's an error string (starts with 'Error:'), note the error and continue to the next video. If it's a valid summary, append it to your list of summaries.
+        ii. Check the result: If it's an error string (starts with 'Error:'), note the error (e.g., by printing or logging it internally) and continue to the next video. If it's a valid summary, append it to your list of summaries.
     d. After attempting to summarize all videos:
         i. If NO valid summaries were collected (all resulted in errors or the initial list was empty), inform the user about the summarization failures. STOP processing.
-        ii. If there are valid summaries, call `{combine_summaries_tool.name}` with the list of successfully generated summary strings.
+        ii. If there are valid summaries, call `{combine_summaries_tool.name}` with the complete list of *successfully* generated summary strings.
         iii. Check the result of `{combine_summaries_tool.name}`. If it's an error string, report that error.
-        iv. If it's the combined summary, return ONLY this final combined summary string to the user. Include a note if some videos failed to summarize.
+        iv. If it's the combined summary, return ONLY this final combined summary string to the user. You can optionally add a brief note if some videos failed to summarize (e.g., "Here is the combined summary for the videos I could process: ...").
 
 IMPORTANT:
-- Always call `{find_videos_tool.name}` first and check its output carefully for errors or an empty list before proceeding.
-- Pass the `session_id` argument to `{find_videos_tool.name}`.
+- Always call `{find_videos_tool.name}` first. Check its output carefully for errors or an empty list before proceeding.
+- You MUST extract the `session_id` from the state and pass it to `{find_videos_tool.name}`. The state key is 'session_id'.
 - Handle potential errors from each tool call gracefully and inform the user.
 - Only return the final combined summary string (or an informative error message) as your final response.
         """
 
-        self._agent = LlmAgent(
-            model=model_name,
-            name="adk_summary_agent",
-            instruction=instruction,
-            description="Summarizes YouTube videos using MCP tools and A2A delegation.",
-            tools=[find_videos_tool, summarize_video_tool, combine_summaries_tool],
-        )
+        # Initialize LlmAgent. If using Vertex, API key is handled by ADK's default credentials.
+        # If not using Vertex, google_api_key needs to be passed (fetched via Secret Manager).
+        agent_kwargs = {
+            "model": model_name,
+            "name": "adk_summary_agent",
+            "instruction": instruction,
+            "description": "Summarizes YouTube videos using MCP tools and A2A delegation.",
+            "tools": [find_videos_tool, summarize_video_tool, combine_summaries_tool],
+        }
+        if not use_vertex:
+            agent_kwargs["api_key"] = google_api_key
+
+        self._agent = LlmAgent(**agent_kwargs)
         logger.info("SummaryAgent initialized with ADK LlmAgent.")
 
     # Expose invoke/stream methods expected by the TaskManager
@@ -88,21 +97,17 @@ IMPORTANT:
 
         runner = InMemoryRunner(self._agent)
         # Use the provided session_id for the ADK run
+        initial_state = {"session_id": session_id} # Inject session_id into state
         session = runner.session_service.create_session(
-             app_name=self._agent.name, user_id="a2a_caller", session_id=session_id
+             app_name=self._agent.name, user_id="a2a_caller", session_id=session_id, state=initial_state
         )
         input_content = genai_types.Content(role="user", parts=[genai_types.Part(text=query)])
 
         try:
-            # Add session_id to the initial state so the agent can access it
-            session.state["session_id"] = session_id
-            runner.session_service.update_session(session) # Persist the state update
-
             events = list(runner.run(user_id=session.user_id, session_id=session.id, new_message=input_content))
             final_response = ""
             if events:
                 last_event = events[-1]
-                # Check if the last event is an error event
                 if last_event.error_code or last_event.error_message:
                      final_response = f"Error: Agent execution failed - {last_event.error_message or last_event.error_code}"
                 elif last_event.content and last_event.content.parts:
@@ -121,42 +126,38 @@ IMPORTANT:
         from google.genai import types as genai_types
 
         runner = InMemoryRunner(self._agent)
+        initial_state = {"session_id": session_id} # Inject session_id into state
         session = runner.session_service.create_session(
-             app_name=self._agent.name, user_id="a2a_caller", session_id=session_id
+             app_name=self._agent.name, user_id="a2a_caller", session_id=session_id, state=initial_state
         )
         input_content = genai_types.Content(role="user", parts=[genai_types.Part(text=query)])
 
         try:
-            # Add session_id to the initial state so the agent can access it
-            session.state["session_id"] = session_id
-            runner.session_service.update_session(session) # Persist the state update
-
             async for event in runner.run_async(user_id=session.user_id, session_id=session.id, new_message=input_content):
                 content_text = ""
                 is_final = event.is_final_response()
-                artifacts = None # Placeholder for potential future artifact handling
+                artifacts = None # Placeholder
 
                 if event.error_code or event.error_message:
                     content_text = f"Error during execution: {event.error_message or event.error_code}"
-                    is_final = True # Treat ADK errors as final
+                    is_final = True
                 elif event.content and event.content.parts:
                      content_text = "".join(p.text for p in event.content.parts if p.text)
-                     # Check for errors returned by tools within the text
-                     if "Error: " in content_text and ("YouTube agent" in content_text or "communicate" in content_text or "summarize" in content_text or "combine" in content_text):
-                         is_final = True # Treat tool/A2A errors as final
+                     if "Error:" in content_text and ("YouTube agent" in content_text or "communicate" in content_text or "summarize" in content_text or "combine" in content_text):
+                         is_final = True
 
                 yield {
                     "is_task_complete": is_final,
-                    "require_user_input": False, # ADK agent doesn't directly require input in this flow
+                    "require_user_input": False,
                     "content": content_text if content_text else "Processing step...",
-                    "artifacts": artifacts # Placeholder
+                    "artifacts": artifacts
                 }
                 if is_final:
-                    break # Stop streaming after final response or error
+                    break
         except Exception as e:
             logger.error(f"Error streaming ADK agent: {e}", exc_info=True)
             yield {
-                "is_task_complete": True, # End stream on error
+                "is_task_complete": True,
                 "require_user_input": False,
                 "content": f"Error: Failed to process request - {type(e).__name__}"
             }

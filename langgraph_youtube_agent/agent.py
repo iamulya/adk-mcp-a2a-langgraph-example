@@ -9,6 +9,7 @@ from langgraph.prebuilt import create_react_agent
 
 # Import async tool functions
 from .tools import get_channel_videos, get_playlist_videos
+from ..utils.secrets import get_google_api_key_from_secret_manager # Import secret manager utility
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +55,14 @@ class YouTubeVideoAgent:
     SUPPORTED_OUTPUT_TYPES = ["application/json", "text/plain"] # Can output JSON list or text error
 
     def __init__(self):
-        google_api_key = os.getenv("GOOGLE_API_KEY")
-        if not google_api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable not set.")
+        try:
+            google_api_key = get_google_api_key_from_secret_manager()
+        except ValueError as e:
+             logger.error(f"Failed to get Google API Key from Secret Manager: {e}")
+             raise ValueError("GOOGLE_API_KEY_SECRET_ID and SECRET_PROJECT_ID must be set in .env") from e
 
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", google_api_key=google_api_key)
-        # *** Use the correct tool names as defined above ***
+        # *** Use the correct tool names as defined in the @tool wrappers ***
         self.tools = [get_channel_videos_tool_sync, get_playlist_videos_tool_sync]
 
         system_message = (

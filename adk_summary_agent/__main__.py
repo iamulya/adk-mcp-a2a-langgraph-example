@@ -15,7 +15,9 @@ from .agent import SummaryAgent
 from .task_manager import AgentTaskManager
 from .tools import _cleanup_summary_mcp_session # Import cleanup function
 
-load_dotenv()
+# Load .env file from the current agent's directory
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=dotenv_path)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,17 +28,19 @@ logger = logging.getLogger(__name__)
 def main(host, port):
     """Starts the ADK Summary Agent A2A server."""
     try:
-        # Check for API key only if Vertex AI is not configured
-        if not os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() == "true":
-            if not os.getenv("GOOGLE_API_KEY"):
-                 raise MissingAPIKeyError("GOOGLE_API_KEY must be set if not using Vertex AI.")
+        # Check for Secret Manager config OR Vertex config
+        use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() == "true"
+        if not use_vertex and (not os.getenv("SECRET_PROJECT_ID") or not os.getenv("GOOGLE_API_KEY_SECRET_ID")):
+             raise MissingAPIKeyError("SECRET_PROJECT_ID and GOOGLE_API_KEY_SECRET_ID must be set in .env if not using Vertex AI.")
+        if use_vertex and (not os.getenv("GOOGLE_CLOUD_PROJECT") or not os.getenv("GOOGLE_CLOUD_LOCATION")):
+             raise MissingAPIKeyError("GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be set in .env if using Vertex AI.")
+
         if not os.getenv("SUMMARY_MCP_SERVER_URL"):
              raise MissingAPIKeyError("SUMMARY_MCP_SERVER_URL environment variable not set.")
         if not os.getenv("YOUTUBE_AGENT_A2A_URL"):
             logger.warning("YOUTUBE_AGENT_A2A_URL not set, defaulting to http://localhost:10003")
 
         # Initialize the agent (this might trigger MCP connection via tools.py)
-        # We need an event loop running to potentially initialize tools that need it
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -53,7 +57,7 @@ def main(host, port):
                 tags=["youtube", "summary", "video", "playlist", "channel", "mcp", "a2a"],
                 examples=[
                     "Summarize videos from channel 'test_channel' on 2024-10-26",
-                    "Give me a summary of playlist 'test_playlist'"
+                    "Give me a summary for playlist 'test_playlist'"
                 ],
             )
         ]
@@ -84,17 +88,19 @@ def main(host, port):
         logger.error(f"An error occurred during server startup: {e}", exc_info=True)
         exit(1)
     finally:
-         # Ensure cleanup happens even if server start fails or stops
+        # Ensure cleanup happens even if server start fails or stops
         try:
-            # Attempt to run cleanup in the loop if it exists
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                loop.run_until_complete(_cleanup_summary_mcp_session())
+                # Schedule cleanup if running
+                asyncio.ensure_future(_cleanup_summary_mcp_session(os.getenv("MCP_URL_SUMMARIZE")))
+                asyncio.ensure_future(_cleanup_summary_mcp_session(os.getenv("MCP_URL_COMBINE")))
             else:
-                asyncio.run(_cleanup_summary_mcp_session())
+                # Run cleanup synchronously if loop isn't running
+                asyncio.run(_cleanup_summary_mcp_session(os.getenv("MCP_URL_SUMMARIZE")))
+                asyncio.run(_cleanup_summary_mcp_session(os.getenv("MCP_URL_COMBINE")))
         except Exception as cleanup_err:
              logger.error(f"Error during MCP cleanup: {cleanup_err}")
-
 
 if __name__ == "__main__":
     main()

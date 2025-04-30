@@ -1,111 +1,173 @@
 import os
+import json
 import logging
 import asyncio
 from contextlib import AsyncExitStack
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
 
-from google.adk.tools.mcp_tool import MCPToolset, MCPTool
-# Choose the correct connection params based on your MCP server type
-from mcp import StdioServerParameters, SseServerParams
+from google.adk.tools.mcp_tool import MCPTool
+from langgraph_sdk.auth.types import MinimalUserDict # Correct import if needed, might not be needed for tool calls directly
+# Correct import for MCP connection parameters might depend on specific MCP client library used by ADK/MCPTool,
+# but for demonstration using ADK's perspective:
+from mcp import StdioServerParameters, SseServerParams, types as mcp_types
+
+from ..utils.secrets import get_secret # Assuming utils is importable from root
 
 logger = logging.getLogger(__name__)
 
-# Configure MCP connection based on environment variables
-mcp_url_or_command = os.getenv("YOUTUBE_MCP_SERVER_URL")
-if not mcp_url_or_command:
-    raise ValueError("YOUTUBE_MCP_SERVER_URL environment variable not set.")
+# --- MCP Session Management ---
+# We need potentially multiple sessions if tools are on different servers
+_mcp_sessions: Dict[str, asyncio.Queue] = {} # URL -> Queue[Session]
+_mcp_stacks: Dict[str, AsyncExitStack] = {} # URL -> ExitStack
+_mcp_session_locks: Dict[str, asyncio.Lock] = {} # URL -> Lock
 
-# --- CHOOSE ONE Connection Type ---
-# Option 1: StdioServerParameters (if MCP server is a command-line tool)
-# Adjust command/args as needed. Assumes the env var is the command itself.
-connection_params = StdioServerParameters(command=mcp_url_or_command)
+async def get_mcp_session(mcp_url_or_command: str) -> mcp_types.ClientSession:
+    """Gets or creates a managed MCP session for a given server URL/command."""
+    if mcp_url_or_command not in _mcp_session_locks:
+        _mcp_session_locks[mcp_url_or_command] = asyncio.Lock()
 
-# Option 2: SseServerParams (if MCP server is running at a URL endpoint)
-# connection_params = SseServerParams(url=mcp_url_or_command)
-# ---------------------------------
+    async with _mcp_session_locks[mcp_url_or_command]:
+        if mcp_url_or_command not in _mcp_sessions:
+            logger.info(f"Creating new MCP session queue for {mcp_url_or_command}")
+            _mcp_sessions[mcp_url_or_command] = asyncio.Queue(maxsize=1) # Pool size 1 for simplicity
+            _mcp_stacks[mcp_url_or_command] = AsyncExitStack()
 
-# Global ExitStack and Toolset instance (lazy initialized)
-_exit_stack: Optional[AsyncExitStack] = None
-_mcp_toolset: Optional[MCPToolset] = None
-_tools: Optional[Dict[str, MCPTool]] = None
+            # --- CHOOSE Connection Type Based on URL/Command ---
+            # This is a heuristic, adjust logic if needed
+            if mcp_url_or_command.startswith("http"):
+                connection_params = SseServerParams(url=mcp_url_or_command) # Assumes SSE if URL
+                logger.info("Using SseServerParams")
+            else:
+                 # Assumes Stdio if not a URL, treats the env var as the command
+                connection_params = StdioServerParameters(command=mcp_url_or_command)
+                logger.info("Using StdioServerParameters")
+            # ---------------------------------------------------
 
-async def get_mcp_tools() -> Dict[str, MCPTool]:
-    """Initializes and returns the MCP tools, managing the session."""
-    global _exit_stack, _mcp_toolset, _tools
-    if _tools is None:
-        logger.info(f"Initializing MCPToolset for YouTube Agent at {mcp_url_or_command}")
-        _exit_stack = AsyncExitStack()
-        _mcp_toolset = MCPToolset(connection_params=connection_params, exit_stack=_exit_stack)
-        # The context manager ensures the session is initialized
-        await _exit_stack.enter_async_context(_mcp_toolset)
-        _tools = {tool.name: tool for tool in await _mcp_toolset.load_tools()}
-        logger.info(f"Loaded MCP tools: {list(_tools.keys())}")
+            try:
+                from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
+                session_manager = MCPSessionManager(
+                    connection_params=connection_params,
+                    exit_stack=_mcp_stacks[mcp_url_or_command]
+                )
+                session = await session_manager.create_session()
+                await _mcp_sessions[mcp_url_or_command].put(session)
+                logger.info(f"MCP session initialized for {mcp_url_or_command}")
 
-         # --- Register cleanup ---
-        import atexit
-        # Ensure cleanup runs in an event loop if called from a sync context like atexit
-        if asyncio.get_event_loop().is_running():
-             atexit.register(lambda: asyncio.ensure_future(_cleanup_mcp_session()))
-        else:
-             atexit.register(asyncio.run, _cleanup_mcp_session())
+                # Register cleanup for this specific session stack
+                import atexit
+                atexit.register(asyncio.run, _cleanup_mcp_session(mcp_url_or_command))
 
+            except Exception as e:
+                logger.error(f"Failed to initialize MCP session for {mcp_url_or_command}: {e}", exc_info=True)
+                # Clean up partially created resources if init fails
+                if mcp_url_or_command in _mcp_stacks:
+                    await _mcp_stacks[mcp_url_or_command].aclose()
+                    del _mcp_stacks[mcp_url_or_command]
+                if mcp_url_or_command in _mcp_sessions:
+                    del _mcp_sessions[mcp_url_or_command]
+                raise # Re-raise the exception
 
-    return _tools
+        # Get a session from the queue (pool)
+        session = await _mcp_sessions[mcp_url_or_command].get()
+        return session
 
-async def _cleanup_mcp_session():
-    """Cleans up the MCP session on exit."""
-    global _exit_stack, _tools
-    if _exit_stack:
-        logger.info("Cleaning up YouTube Agent MCP session...")
-        await _exit_stack.aclose()
-        _exit_stack = None
-        _tools = None # Reset tools as well
-        logger.info("YouTube Agent MCP session closed.")
+async def release_mcp_session(mcp_url_or_command: str, session: mcp_types.ClientSession):
+    """Releases a session back to the pool."""
+    if mcp_url_or_command in _mcp_sessions:
+        await _mcp_sessions[mcp_url_or_command].put(session)
+
+async def _cleanup_mcp_session(mcp_url_or_command: str):
+    """Cleans up a specific MCP session stack."""
+    if mcp_url_or_command in _mcp_stacks:
+        logger.info(f"Cleaning up MCP session for {mcp_url_or_command}...")
+        stack = _mcp_stacks.pop(mcp_url_or_command)
+        await stack.aclose()
+        if mcp_url_or_command in _mcp_sessions:
+            del _mcp_sessions[mcp_url_or_command] # Remove queue
+        if mcp_url_or_command in _mcp_session_locks:
+            del _mcp_session_locks[mcp_url_or_command] # Remove lock
+        logger.info(f"MCP session closed for {mcp_url_or_command}.")
+
+# --- MCP Tool Functions ---
 
 async def get_channel_videos(channel_id: str, date: str) -> list[str]:
-    """Gets video IDs from a YouTube channel for a specific date via MCP."""
-    tools = await get_mcp_tools()
-    # *** Replace with the EXACT name provided by your MCP server ***
-    tool_name = "get_channel_videos_by_date"
-    if tool_name not in tools:
-        raise ValueError(f"MCP Tool '{tool_name}' not found. Available: {list(tools.keys())}")
-    logger.info(f"Calling MCP tool '{tool_name}' with channel_id={channel_id}, date={date}")
-    try:
-        # Pass arguments matching the MCP tool's expected input schema
-        result = await tools[tool_name].run_async(args={"channel_id": channel_id, "date": date}, tool_context=None)
-        # Ensure result is a list of strings
-        if isinstance(result, list):
-            return [str(item) for item in result]
-        elif result is None:
-            return []
-        else:
-            logger.warning(f"MCP tool '{tool_name}' returned non-list: {result}. Wrapping in list.")
-            return [str(result)]
-    except Exception as e:
-        logger.error(f"Error calling MCP tool '{tool_name}': {e}", exc_info=True)
-        raise # Re-raise to be caught by the sync wrapper
+    """Gets video URLs from a YouTube channel for a specific date via MCP."""
+    mcp_endpoint = os.getenv("MCP_URL_GET_CHANNEL")
+    if not mcp_endpoint:
+        raise ValueError("MCP_URL_GET_CHANNEL environment variable not set.")
 
-async def get_playlist_videos(playlist_id: str) -> list[str]:
-    """Gets video IDs from a YouTube playlist via MCP."""
-    tools = await get_mcp_tools()
-     # *** Replace with the EXACT name provided by your MCP server ***
-    tool_name = "get_playlist_videos"
-    if tool_name not in tools:
-        raise ValueError(f"MCP Tool '{tool_name}' not found. Available: {list(tools.keys())}")
-    logger.info(f"Calling MCP tool '{tool_name}' with playlist_id={playlist_id}")
+    session = await get_mcp_session(mcp_endpoint)
     try:
-        # Pass arguments matching the MCP tool's expected input schema
-        result = await tools[tool_name].run_async(args={"playlist_id": playlist_id}, tool_context=None)
-        # Ensure result is a list of strings
-        if isinstance(result, list):
-            return [str(item) for item in result]
+        # *** Tool name must match the name provided by the MCP server ***
+        tool_name = "get_youtube_videos_for_channel_date"
+        logger.info(f"Calling MCP tool '{tool_name}' on {mcp_endpoint}")
+        # Arguments must match the MCP tool's input schema
+        result = await session.call_tool(tool_name, arguments={"channel_id": channel_id, "date": date})
+        logger.debug(f"MCP Raw result for {tool_name}: {result}")
+
+        # --- Parse the specific response structure ---
+        if isinstance(result, dict) and "video_urls" in result and isinstance(result["video_urls"], list):
+            return [str(url) for url in result["video_urls"]]
+        elif isinstance(result, dict) and "error" in result:
+             logger.error(f"MCP tool '{tool_name}' returned error: {result['error']}")
+             return [f"Error from get_channel_videos: {result['error']}"]
         elif result is None:
              return []
         else:
-            logger.warning(f"MCP tool '{tool_name}' returned non-list: {result}. Wrapping in list.")
-            return [str(result)]
+            logger.warning(f"Unexpected result format from MCP tool '{tool_name}': {result}")
+            # Attempt to return as string list if possible, otherwise error
+            try:
+                return [str(result)]
+            except:
+                return [f"Error: Unexpected result format from {tool_name}"]
+        # ------------------------------------------
     except Exception as e:
         logger.error(f"Error calling MCP tool '{tool_name}': {e}", exc_info=True)
-        raise # Re-raise to be caught by the sync wrapper
+        return [f"Error contacting video finding service: {type(e).__name__}"]
+    finally:
+        await release_mcp_session(mcp_endpoint, session)
 
-# Note: We wrap these async functions in LangChain Tools within agent.py
+
+async def get_playlist_videos(playlist_id: str) -> list[str]:
+    """Gets video URLs from a YouTube playlist via MCP."""
+    mcp_endpoint = os.getenv("MCP_URL_GET_PLAYLIST")
+    if not mcp_endpoint:
+        raise ValueError("MCP_URL_GET_PLAYLIST environment variable not set.")
+
+    session = await get_mcp_session(mcp_endpoint)
+    try:
+        # *** Tool name must match the name provided by the MCP server ***
+        tool_name = "get_playlist_videos"
+        logger.info(f"Calling MCP tool '{tool_name}' on {mcp_endpoint}")
+        # Arguments must match the MCP tool's input schema
+        result = await session.call_tool(tool_name, arguments={"playlist_id": playlist_id})
+        logger.debug(f"MCP Raw result for {tool_name}: {result}")
+
+        # --- Parse the specific response structure ---
+        # Assuming the response is a dict containing a list under 'video_urls' or similar key.
+        # Adjust the key based on your actual MCP tool response schema.
+        video_urls_key = "video_urls" # Example key, replace if needed
+        if isinstance(result, dict) and video_urls_key in result and isinstance(result[video_urls_key], list):
+            return [str(url) for url in result[video_urls_key]]
+        elif isinstance(result, dict) and "error" in result:
+             logger.error(f"MCP tool '{tool_name}' returned error: {result['error']}")
+             return [f"Error from get_playlist_videos: {result['error']}"]
+        elif result is None:
+             return []
+        elif isinstance(result, list): # Direct list fallback
+            logger.warning(f"MCP tool '{tool_name}' returned a direct list, expected dict.")
+            return [str(item) for item in result]
+        else:
+            logger.warning(f"Unexpected result format from MCP tool '{tool_name}': {result}")
+            try:
+                return [str(result)]
+            except:
+                 return [f"Error: Unexpected result format from {tool_name}"]
+        # ------------------------------------------
+    except Exception as e:
+        logger.error(f"Error calling MCP tool '{tool_name}': {e}", exc_info=True)
+        return [f"Error contacting playlist service: {type(e).__name__}"]
+    finally:
+        await release_mcp_session(mcp_endpoint, session)
+
+# Note: These async functions are wrapped in sync LangChain Tools in agent.py
