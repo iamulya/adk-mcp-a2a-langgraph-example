@@ -17,7 +17,7 @@ def get_secret(project_id: str, secret_id: str, version_id: str = "latest") -> s
         raise ValueError("Both SECRET_PROJECT_ID and GOOGLE_API_KEY_SECRET_ID must be set in .env")
 
     client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/1"
     logger.info(f"Attempting to fetch secret: {name}")
     try:
         response = client.access_secret_version(request={"name": name})
